@@ -45,7 +45,7 @@ ShopVerse solves these with a clean, decoupled architecture: strict JWT-scoped r
 | 🛍️ **Catalog** | Paginated search, category filters, live stock validation, multipart image uploads |
 | 🛒 **Cart** | Backend-persisted + Redux-synced cart, coupon engine, session-safe purging on logout |
 | 📍 **Addresses** | Multi-address book, default checkout selection, FK-safe deletion (preserves order history) |
-| 💳 **Payments** | Stripe `PaymentIntent` flow + PayPal Express Checkout (sandbox) |
+| 💳 **Payments** | Stripe `PaymentIntent` flow, PayPal Express Checkout (sandbox), and Cash on Delivery (COD) |
 | 📊 **Dashboards** | Seller inventory/order console, Admin sales analytics + global order oversight |
 
 ---
@@ -247,11 +247,52 @@ erDiagram
 
 ---
 
-## 💳 Payment Integration Snapshot
+## 💳 Payment Integration
 
-**Stripe** — Backend creates a `PaymentIntent`, returns a `clientSecret`, frontend mounts Stripe `<PaymentElement />`; on approval the backend verifies status server-side before persisting the order.
+### Stripe
+1. **PaymentIntent Creation** — Frontend calls `POST /api/order/stripe-client-secret` with order total + currency.
+2. **Backend Processing** — `StripeServiceImpl` initializes a Stripe `PaymentIntent`:
 
-**PayPal** — Frontend embeds the PayPal JS SDK sandbox buttons; on `onApprove`, the captured transaction details are posted to the backend, which persists the order tagged `paymentMethod: "paypal"`.
+```java
+PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
+        .setAmount((long) (totalAmount * 100)) // Amount in cents
+        .setCurrency("usd")
+        .setAutomaticPaymentMethods(
+                PaymentIntentCreateParams.AutomaticPaymentMethods.builder()
+                        .setEnabled(true)
+                        .build()
+        )
+        .build();
+PaymentIntent intent = PaymentIntent.create(params);
+```
+
+3. **Client-Side Confirmation** — Frontend embeds `<Elements stripe={stripePromise} options={{ clientSecret }}>` and mounts `<PaymentElement />`.
+4. **Order Finalization** — On approval, frontend calls `POST /api/order/users/payments/stripe`; backend verifies payment state, persists `Order` + `Payment`, and clears the cart.
+
+### PayPal
+1. **SDK Initialization** — Frontend embeds the PayPal JS SDK (`@paypal/react-paypal-js`) with sandbox `clientId`.
+2. **Approval Handling**:
+
+```javascript
+onApprove: async (data, actions) => {
+    const details = await actions.order.capture();
+    // Send transaction details to backend order payment endpoint
+    await dispatch(stripePaymentConfirmation({
+        paymentMethod: "paypal",
+        pgPaymentId: details.id,
+        pgStatus: details.status
+    }));
+}
+```
+
+3. **Backend Persistence** — Backend creates an order entry marked `paymentMethod: "paypal"` and links payment metadata to the customer's purchase record.
+
+### Cash on Delivery (COD)
+For users who prefer not to pay online, the checkout flow supports COD as a third method:
+1. User selects **Cash on Delivery** at the payment step instead of Stripe/PayPal.
+2. Frontend calls `POST /api/order/users/payments/cod` (no client-side payment confirmation required).
+3. Backend creates the `Order` and `Payment` records with `paymentMethod: "cod"` and an initial status of **Pending**, updates inventory, and clears the cart — the same as the other two flows, minus the gateway round-trip.
+4. Sellers/Admins later mark the order **Delivered**, at which point payment is collected in person.
 
 ---
 
